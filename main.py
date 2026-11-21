@@ -5,7 +5,6 @@ import pyarrow.dataset as ds
 import pyarrow.compute as pc
 import pyarrow as pa
 from huggingface_hub import HfFileSystem
-import os
 import time
 import json
 import re
@@ -21,14 +20,11 @@ app.add_middleware(
 )
 
 # --- Configuration ---
-HF_REPO = "ayush5218/AT"
-# Using token=False for public dataset access
+HF_REPO = "Anonymous-5218/AT" 
 global_fs = HfFileSystem(token=False) 
-
-# Cache datasets in memory so metadata isn't fetched twice
 dataset_cache = {}
 
-# --- PHONE RANGE ROUTER (Author's Method) ---
+# --- PHONE RANGE ROUTER ---
 PHONE_LIMITS = [
     (6230309204, 7051894468, "A_1.parquet"), (7051894476, 7250427787, "A_2.parquet"),
     (7250427792, 7348939102, "A_3.parquet"), (7348939103, 7461906080, "A_4.parquet"),
@@ -70,13 +66,14 @@ def get_dataset(file_path):
         dataset_cache[file_path] = ds.dataset(file_path, filesystem=global_fs, format="parquet")
     return dataset_cache[file_path]
 
-def clean_records(table):
+def clean_records(table, source_name):
     if table is None or table.num_rows == 0:
         return []
     records = table.to_pylist()
     cleaned = []
     for rec in records:
         clean_rec = {k: v for k, v in rec.items() if v is not None and str(v).strip().lower() not in ['null', 'none', '']}
+        clean_rec["source"] = source_name
         cleaned.append(clean_rec)
     return cleaned
 
@@ -89,29 +86,28 @@ def search(q: str = Query(..., description="Search query (Phone, Email, or Name)
     start_time = time.time()
     q = q.strip()
     if not q:
-        return Response(content=json.dumps({"error": "Empty query"}), media_type="application/json", status_code=400)
+        return Response(content=json.dumps({"error": "Empty query"}, indent=4), media_type="application/json", status_code=400)
 
     results = {}
     clean_phone = re.sub(r'\D', '', q)
 
     try:
-        # 1. Phone Search (Range Routing)
+        # 1. Phone Search
         if len(clean_phone) == 10 and clean_phone == q.replace(" ", "").replace("-", ""):
             target_filename = get_phone_target_file(clean_phone)
             if not target_filename:
-                return Response(content=json.dumps({"error": "Number out of range"}), media_type="application/json", status_code=400)
+                return Response(content=json.dumps({"error": "Number out of range"}, indent=4), media_type="application/json", status_code=400)
                 
             file_path = f"datasets/{HF_REPO}/A_index/{target_filename}"
             dataset = get_dataset(file_path)
             
-            # Blazing fast filter using PyArrow expressions
             filter_expr = ds.field('mobile') == int(clean_phone)
-            table = dataset.to_table(filter=filter_expr, columns=['mobile', 'name', 'email', 'address', 'carrier'])
+            table = dataset.to_table(filter=filter_expr)
             
             if table.num_rows > 0:
-                results["Airtel_Master"] = clean_records(table)
+                results["Airtel_Master"] = clean_records(table, "Airtel")
                 
-        # 2. Email Search (Bucket Routing)
+        # 2. Email Search
         elif '@' in q:
             email = q.lower()
             bucket = get_alphabet_bucket_number(email)
@@ -122,7 +118,6 @@ def search(q: str = Query(..., description="Search query (Phone, Email, or Name)
             file_path = f"datasets/{HF_REPO}/E_index/{target_filename}"
             dataset = get_dataset(file_path)
             
-            # Read only necessary columns to memory, then filter case-insensitively
             table = dataset.to_table(columns=['email', 'name', 'mobile'])
             col = table['email'].cast(pa.string())
             mask = pc.match_substring(col, email, ignore_case=True)
@@ -130,9 +125,9 @@ def search(q: str = Query(..., description="Search query (Phone, Email, or Name)
             
             filtered = table.filter(mask)
             if filtered.num_rows > 0:
-                results[result_key] = clean_records(filtered)
+                results[result_key] = clean_records(filtered, "Airtel")
                 
-        # 3. Name Search (Bucket Routing)
+        # 3. Name Search
         else:
             name = q.lower()
             bucket = get_alphabet_bucket_number(name)
@@ -150,19 +145,21 @@ def search(q: str = Query(..., description="Search query (Phone, Email, or Name)
             
             filtered = table.filter(mask)
             if filtered.num_rows > 0:
-                results[result_key] = clean_records(filtered)
+                results[result_key] = clean_records(filtered, "Airtel")
 
-    except Exception as e:
-        # If the file doesn't exist or any other error occurs
+    except Exception:
         pass
 
     exec_time = (time.time() - start_time) * 1000
     
+    # Format the output exactly as requested
     response_data = {
+        "credits": "Mr Anonymous",
         "query": q,
-        "results": results if results else None,
-        "execution_time_ms": round(exec_time, 2)
+        "source": "Airtel",
+        "execution_time_ms": round(exec_time, 2),
+        "results": results if results else None
     }
     
-    # Returning via Response and json.dumps prevents FastAPI 500 serialization errors
-    return Response(content=json.dumps(response_data, default=str), media_type="application/json")
+    # Force indent=4 permanently. No URL parameter needed.
+    return Response(content=json.dumps(response_data, indent=4, default=str), media_type="application/json")
