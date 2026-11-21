@@ -1,3 +1,5 @@
 fastapi
 uvicorn
-duckdb
+pyarrow
+fsspec
+requests
