@@ -1,6 +1,9 @@
 import re
-import duckdb
-import os
+import time
+import fsspec
+import pyarrow.parquet as pq
+import pyarrow.compute as pc
+import pyarrow as pa
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 
@@ -8,16 +11,11 @@ from fastapi.responses import JSONResponse
 HF_REPO = "ayush5218/AT"
 HF_BASE_URL = f"https://huggingface.co/datasets/{HF_REPO}/resolve/main"
 
-# --- Vercel / Lambda DuckDB Setup ---
-# Vercel has a read-only filesystem. DuckDB needs a writable dir to unpack httpfs.
-os.makedirs("/tmp/duckdb_ext", exist_ok=True)
-con = duckdb.connect()
-con.execute("SET extension_directory='/tmp/duckdb_ext';")
-con.execute("INSTALL httpfs;")
-con.execute("LOAD httpfs;")
-
-# Initialize FastAPI app
+# Initialize FastAPI
 app = FastAPI(title="Smart Universal Search Engine")
+
+# Initialize fsspec HTTP filesystem (handles HF redirects flawlessly)
+fs = fsspec.filesystem("http")
 
 # --- PHONE RANGE ROUTER (Author's Method) ---
 PHONE_LIMITS = [
@@ -56,37 +54,47 @@ def get_alphabet_bucket_number(text):
         return str(ord(first_char) - ord('a') + 1)
     return "overflow"
 
-def clean_dict(row):
-    return {k: v for k, v in row.items() if v is not None and str(v).strip().lower() not in ['null', 'none', '']}
+def clean_results(table):
+    if table is None or table.num_rows == 0:
+        return []
+    records = table.to_pylist()
+    cleaned = []
+    for rec in records:
+        clean_rec = {k: v for k, v in rec.items() if v is not None and str(v).strip().lower() not in ['null', 'none', '']}
+        cleaned.append(clean_rec)
+    return cleaned
 
 # --- API Endpoint ---
 @app.get("/search")
 def search(q: str = Query(..., description="Search query (Phone, Email, or Name)")):
-    start_time = __import__('time').time()
-    results = {}
+    start_time = time.time()
     q = q.strip()
-    
     if not q:
         return JSONResponse(status_code=400, content={"error": "Empty query"})
 
+    results = {}
     clean_phone = re.sub(r'\D', '', q)
-    
+
     try:
-        # 1. Phone Search
+        # 1. Phone Search (Blazing Fast Predicate Pushdown)
         if len(clean_phone) == 10 and clean_phone == q.replace(" ", "").replace("-", ""):
             target_filename = get_phone_target_file(clean_phone)
             if not target_filename:
                 return {"error": "Number out of range"}
                 
             url = f"{HF_BASE_URL}/A_index/{target_filename}"
-            query = "SELECT mobile, name, email, address, carrier FROM read_parquet(?) WHERE mobile = ?"
-            res = con.execute(query, [url, int(clean_phone)]).fetchall()
             
-            if res:
-                columns = ['mobile', 'name', 'email', 'address', 'carrier']
-                results["Airtel_Master"] = [clean_dict(dict(zip(columns, row))) for row in res]
+            # PyArrow will ONLY download the row groups that match this phone number
+            table = pq.read_table(
+                url, 
+                columns=['mobile', 'name', 'email', 'address', 'carrier'], 
+                filters=[('mobile', '=', int(clean_phone))],
+                filesystem=fs
+            )
+            if table.num_rows > 0:
+                results["Airtel_Master"] = clean_results(table)
                 
-        # 2. Email Search
+        # 2. Email Search (Case-Insensitive)
         elif '@' in q:
             email = q.lower()
             bucket = get_alphabet_bucket_number(email)
@@ -98,15 +106,19 @@ def search(q: str = Query(..., description="Search query (Phone, Email, or Name)
                 url = f"{HF_BASE_URL}/E_index/E_{bucket}.parquet"
                 result_key = f"E_{bucket}"
 
-            # ILIKE makes it case-insensitive natively in DuckDB C++
-            query = "SELECT email, name, mobile FROM read_parquet(?) WHERE email ILIKE ?"
-            res = con.execute(query, [url, email]).fetchall()
+            # Read only needed columns to save bandwidth
+            table = pq.read_table(url, columns=['email', 'name', 'mobile'], filesystem=fs)
             
-            if res:
-                columns = ['email', 'name', 'mobile']
-                results[result_key] = [clean_dict(dict(zip(columns, row))) for row in res]
+            # pc.match_substring ignores case natively in C++
+            col = table['email'].cast(pa.string())
+            mask = pc.match_substring(col, email, ignore_case=True)
+            mask = pc.fill_null(mask, False)
+            
+            filtered = table.filter(mask)
+            if filtered.num_rows > 0:
+                results[result_key] = clean_results(filtered)
                 
-        # 3. Name Search
+        # 3. Name Search (Case-Insensitive Substring)
         else:
             name = q.lower()
             bucket = get_alphabet_bucket_number(name)
@@ -118,19 +130,20 @@ def search(q: str = Query(..., description="Search query (Phone, Email, or Name)
                 url = f"{HF_BASE_URL}/D_index/D_{bucket}.parquet"
                 result_key = f"D_{bucket}"
 
-            # % wildcards for partial name matching
-            query = "SELECT name, mobile, email FROM read_parquet(?) WHERE name ILIKE ?"
-            res = con.execute(query, [url, f"%{name}%"]).fetchall()
+            table = pq.read_table(url, columns=['name', 'mobile', 'email'], filesystem=fs)
+            col = table['name'].cast(pa.string())
+            mask = pc.match_substring(col, name, ignore_case=True)
+            mask = pc.fill_null(mask, False)
             
-            if res:
-                columns = ['name', 'mobile', 'email']
-                results[result_key] = [clean_dict(dict(zip(columns, row))) for row in res]
+            filtered = table.filter(mask)
+            if filtered.num_rows > 0:
+                results[result_key] = clean_results(filtered)
 
     except Exception as e:
-        # Catch network issues or file-not-found issues silently, or log them
+        # Catch file-not-found or HTTP errors silently
         pass
 
-    exec_time = (__import__('time').time() - start_time) * 1000
+    exec_time = (time.time() - start_time) * 1000
     
     return {
         "query": q,
