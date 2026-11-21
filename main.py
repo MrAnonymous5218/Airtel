@@ -1,21 +1,30 @@
-import re
-import time
-import fsspec
-import pyarrow.parquet as pq
-import pyarrow.compute as pc
-import pyarrow as pa
 from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+import pyarrow.dataset as ds
+import pyarrow.compute as pc
+from huggingface_hub import HfFileSystem
+import os
+import time
+import json
+import re
+
+app = FastAPI(title="Airtel Search API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # --- Configuration ---
 HF_REPO = "ayush5218/AT"
-HF_BASE_URL = f"https://huggingface.co/datasets/{HF_REPO}/resolve/main"
+global_fs = HfFileSystem() # This natively handles HF redirects flawlessly on Vercel
 
-# Initialize FastAPI
-app = FastAPI(title="Smart Universal Search Engine")
-
-# Initialize fsspec HTTP filesystem (handles HF redirects flawlessly)
-fs = fsspec.filesystem("http")
+# Cache datasets in memory so metadata isn't fetched twice
+dataset_cache = {}
 
 # --- PHONE RANGE ROUTER (Author's Method) ---
 PHONE_LIMITS = [
@@ -54,7 +63,12 @@ def get_alphabet_bucket_number(text):
         return str(ord(first_char) - ord('a') + 1)
     return "overflow"
 
-def clean_results(table):
+def get_dataset(file_path):
+    if file_path not in dataset_cache:
+        dataset_cache[file_path] = ds.dataset(file_path, filesystem=global_fs, format="parquet")
+    return dataset_cache[file_path]
+
+def clean_records(table):
     if table is None or table.num_rows == 0:
         return []
     records = table.to_pylist()
@@ -64,89 +78,84 @@ def clean_results(table):
         cleaned.append(clean_rec)
     return cleaned
 
-# --- API Endpoint ---
+@app.get("/")
+def root():
+    return {"status": "online", "message": "Airtel Search API is Live."}
+
 @app.get("/search")
 def search(q: str = Query(..., description="Search query (Phone, Email, or Name)")):
     start_time = time.time()
     q = q.strip()
     if not q:
-        return JSONResponse(status_code=400, content={"error": "Empty query"})
+        return Response(content=json.dumps({"error": "Empty query"}), media_type="application/json", status_code=400)
 
     results = {}
     clean_phone = re.sub(r'\D', '', q)
 
     try:
-        # 1. Phone Search (Blazing Fast Predicate Pushdown)
+        # 1. Phone Search (Range Routing)
         if len(clean_phone) == 10 and clean_phone == q.replace(" ", "").replace("-", ""):
             target_filename = get_phone_target_file(clean_phone)
             if not target_filename:
-                return {"error": "Number out of range"}
+                return Response(content=json.dumps({"error": "Number out of range"}), media_type="application/json", status_code=400)
                 
-            url = f"{HF_BASE_URL}/A_index/{target_filename}"
+            file_path = f"datasets/{HF_REPO}/A_index/{target_filename}"
+            dataset = get_dataset(file_path)
             
-            # PyArrow will ONLY download the row groups that match this phone number
-            table = pq.read_table(
-                url, 
-                columns=['mobile', 'name', 'email', 'address', 'carrier'], 
-                filters=[('mobile', '=', int(clean_phone))],
-                filesystem=fs
-            )
+            # Blazing fast filter using PyArrow expressions
+            filter_expr = ds.field('mobile') == int(clean_phone)
+            table = dataset.scanner(filter=filter_expr, columns=['mobile', 'name', 'email', 'address', 'carrier']).head(10)
+            
             if table.num_rows > 0:
-                results["Airtel_Master"] = clean_results(table)
+                results["Airtel_Master"] = clean_records(table)
                 
-        # 2. Email Search (Case-Insensitive)
+        # 2. Email Search (Bucket Routing)
         elif '@' in q:
             email = q.lower()
             bucket = get_alphabet_bucket_number(email)
             
-            if bucket == "overflow":
-                url = f"{HF_BASE_URL}/E_index/E_overflow.parquet"
-                result_key = "E_Overflow"
-            else:
-                url = f"{HF_BASE_URL}/E_index/E_{bucket}.parquet"
-                result_key = f"E_{bucket}"
-
-            # Read only needed columns to save bandwidth
-            table = pq.read_table(url, columns=['email', 'name', 'mobile'], filesystem=fs)
+            target_filename = f"E_overflow.parquet" if bucket == "overflow" else f"E_{bucket}.parquet"
+            result_key = "E_Overflow" if bucket == "overflow" else f"E_{bucket}"
             
-            # pc.match_substring ignores case natively in C++
-            col = table['email'].cast(pa.string())
-            mask = pc.match_substring(col, email, ignore_case=True)
-            mask = pc.fill_null(mask, False)
+            file_path = f"datasets/{HF_REPO}/E_index/{target_filename}"
+            dataset = get_dataset(file_path)
             
-            filtered = table.filter(mask)
-            if filtered.num_rows > 0:
-                results[result_key] = clean_results(filtered)
+            # Case-insensitive match for emails
+            filter_expr = pc.match_substring(ds.field('email'), email, ignore_case=True)
+            table = dataset.scanner(filter=filter_expr, columns=['email', 'name', 'mobile']).head(10)
+            
+            if table.num_rows > 0:
+                results[result_key] = clean_records(table)
                 
-        # 3. Name Search (Case-Insensitive Substring)
+        # 3. Name Search (Bucket Routing)
         else:
             name = q.lower()
             bucket = get_alphabet_bucket_number(name)
             
-            if bucket == "overflow":
-                url = f"{HF_BASE_URL}/D_index/D_overflow.parquet"
-                result_key = "D_Overflow"
-            else:
-                url = f"{HF_BASE_URL}/D_index/D_{bucket}.parquet"
-                result_key = f"D_{bucket}"
-
-            table = pq.read_table(url, columns=['name', 'mobile', 'email'], filesystem=fs)
-            col = table['name'].cast(pa.string())
-            mask = pc.match_substring(col, name, ignore_case=True)
-            mask = pc.fill_null(mask, False)
+            target_filename = f"D_overflow.parquet" if bucket == "overflow" else f"D_{bucket}.parquet"
+            result_key = "D_Overflow" if bucket == "overflow" else f"D_{bucket}"
             
-            filtered = table.filter(mask)
-            if filtered.num_rows > 0:
-                results[result_key] = clean_results(filtered)
+            file_path = f"datasets/{HF_REPO}/D_index/{target_filename}"
+            dataset = get_dataset(file_path)
+            
+            # Case-insensitive match for names
+            filter_expr = pc.match_substring(ds.field('name'), name, ignore_case=True)
+            table = dataset.scanner(filter=filter_expr, columns=['name', 'mobile', 'email']).head(10)
+            
+            if table.num_rows > 0:
+                results[result_key] = clean_records(table)
 
     except Exception as e:
-        # Catch file-not-found or HTTP errors silently
+        # If the file doesn't exist (e.g., E_15) or any other error occurs
         pass
 
     exec_time = (time.time() - start_time) * 1000
     
-    return {
+    response_data = {
         "query": q,
         "results": results if results else None,
         "execution_time_ms": round(exec_time, 2)
     }
+    
+    # Returning via Response and json.dumps prevents FastAPI 500 serialization errors
+    return Response(content=json.dumps(response_data, default=str), media_type="application/json")
