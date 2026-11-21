@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 import pyarrow.dataset as ds
 import pyarrow.compute as pc
+import pyarrow as pa
 from huggingface_hub import HfFileSystem
 import os
 import time
@@ -21,7 +22,8 @@ app.add_middleware(
 
 # --- Configuration ---
 HF_REPO = "ayush5218/AT"
-global_fs = HfFileSystem() # This natively handles HF redirects flawlessly on Vercel
+# Using token=False for public dataset access
+global_fs = HfFileSystem(token=False) 
 
 # Cache datasets in memory so metadata isn't fetched twice
 dataset_cache = {}
@@ -104,7 +106,7 @@ def search(q: str = Query(..., description="Search query (Phone, Email, or Name)
             
             # Blazing fast filter using PyArrow expressions
             filter_expr = ds.field('mobile') == int(clean_phone)
-            table = dataset.scanner(filter=filter_expr, columns=['mobile', 'name', 'email', 'address', 'carrier']).head(10)
+            table = dataset.to_table(filter=filter_expr, columns=['mobile', 'name', 'email', 'address', 'carrier'])
             
             if table.num_rows > 0:
                 results["Airtel_Master"] = clean_records(table)
@@ -120,12 +122,15 @@ def search(q: str = Query(..., description="Search query (Phone, Email, or Name)
             file_path = f"datasets/{HF_REPO}/E_index/{target_filename}"
             dataset = get_dataset(file_path)
             
-            # Case-insensitive match for emails
-            filter_expr = pc.match_substring(ds.field('email'), email, ignore_case=True)
-            table = dataset.scanner(filter=filter_expr, columns=['email', 'name', 'mobile']).head(10)
+            # Read only necessary columns to memory, then filter case-insensitively
+            table = dataset.to_table(columns=['email', 'name', 'mobile'])
+            col = table['email'].cast(pa.string())
+            mask = pc.match_substring(col, email, ignore_case=True)
+            mask = pc.fill_null(mask, False)
             
-            if table.num_rows > 0:
-                results[result_key] = clean_records(table)
+            filtered = table.filter(mask)
+            if filtered.num_rows > 0:
+                results[result_key] = clean_records(filtered)
                 
         # 3. Name Search (Bucket Routing)
         else:
@@ -138,15 +143,17 @@ def search(q: str = Query(..., description="Search query (Phone, Email, or Name)
             file_path = f"datasets/{HF_REPO}/D_index/{target_filename}"
             dataset = get_dataset(file_path)
             
-            # Case-insensitive match for names
-            filter_expr = pc.match_substring(ds.field('name'), name, ignore_case=True)
-            table = dataset.scanner(filter=filter_expr, columns=['name', 'mobile', 'email']).head(10)
+            table = dataset.to_table(columns=['name', 'mobile', 'email'])
+            col = table['name'].cast(pa.string())
+            mask = pc.match_substring(col, name, ignore_case=True)
+            mask = pc.fill_null(mask, False)
             
-            if table.num_rows > 0:
-                results[result_key] = clean_records(table)
+            filtered = table.filter(mask)
+            if filtered.num_rows > 0:
+                results[result_key] = clean_records(filtered)
 
     except Exception as e:
-        # If the file doesn't exist (e.g., E_15) or any other error occurs
+        # If the file doesn't exist or any other error occurs
         pass
 
     exec_time = (time.time() - start_time) * 1000
